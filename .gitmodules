@@ -1,0 +1,3 @@
+[submodule "lib/decode_demcon3"]
+	path = lib/decode_demcon3
+	url = https://github.com/JeroenVerberneDemcon/DecodeDemcon3.git
