@@ -1,8 +1,8 @@
-use std::collections::HashMap;
 use anyhow::{anyhow, Result};
-use pyo3::{prelude::*, types::PyDict};
-use owo_colors::OwoColorize;
 use clap::{Parser, Subcommand};
+use owo_colors::OwoColorize;
+use pyo3::{prelude::*, types::PyDict};
+use std::collections::HashMap;
 
 const SOURCE: &str = include_str!("../lib/decode_demcon3/mineField.py");
 
@@ -58,7 +58,7 @@ impl<'a> Minefield<'a> {
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-struct Pos (i32, i32);
+struct Pos(i32, i32);
 
 #[derive(Clone, Copy)]
 enum Cell {
@@ -99,13 +99,13 @@ impl<'a> Solver<'a> {
         let Pos(col, row) = pos;
         let n = self.minefield.sweep_cell(col, row)?;
         let cell = Cell::Number(n);
-        let i = self.index(pos).ok_or(anyhow!("Bad index"))?;
+        let i = self.index(pos).ok_or_else(|| anyhow!("Bad index"))?;
         self.board[i] = cell;
         Ok(cell)
     }
 
     fn plant_flag(&mut self, pos: Pos) -> Result<()> {
-        let i = self.index(pos).ok_or(anyhow!("Bad index"))?;
+        let i = self.index(pos).ok_or_else(|| anyhow!("Bad index"))?;
         self.board[i] = Cell::Flag;
         Ok(())
     }
@@ -124,11 +124,10 @@ impl<'a> Solver<'a> {
         ];
         let r: Vec<(Pos, Cell)> = list
             .iter()
-            .map(|(c, r)| {
+            .filter_map(|(c, r)| {
                 self.get(Pos(col + c, row + r))
                     .map(|cell| (Pos(col + c, row + r), cell))
             })
-            .filter_map(|id| id)
             .collect();
 
         r
@@ -136,43 +135,55 @@ impl<'a> Solver<'a> {
 
     fn solve(&mut self) -> Result<()> {
         let mut active: Vec<Pos> = Vec::new();
-        let mut next: Vec<Pos> = Vec::new();
 
         // First guess
-        next.push(Pos(0, 0));
+        let mut next = vec![Pos(0, 0)];
 
         loop {
-
             active.clear();
             std::mem::swap(&mut active, &mut next);
             let mut new_info = false;
 
-
             for pos in active.iter().copied() {
-                let cell = self.get(pos).ok_or(anyhow!("Bad active cell location"))?;
+                let cell = self
+                    .get(pos)
+                    .ok_or_else(|| anyhow!("Bad active cell location"))?;
 
                 match cell {
-                    Cell::Number(bombs) => {
-                        let bombs: i32 = bombs.into();
+                    Cell::Number(mines) => {
+                        let mines: i32 = mines.into();
                         let neighbors = self.neighbors(pos);
-                        let flags: i32 = neighbors.iter().filter(|(_, cell)| matches!(cell, Cell::Flag)).count().try_into().unwrap();
-                        let unknowns: i32 = neighbors.iter().filter(|(_, cell)| matches!(cell, Cell::Unknown)).count().try_into().unwrap();
+                        let flags: i32 = neighbors
+                            .iter()
+                            .filter(|(_, cell)| matches!(cell, Cell::Flag))
+                            .count()
+                            .try_into()
+                            .unwrap();
+                        let unknowns: i32 = neighbors
+                            .iter()
+                            .filter(|(_, cell)| matches!(cell, Cell::Unknown))
+                            .count()
+                            .try_into()
+                            .unwrap();
 
-                        if bombs == flags {
-                            for p in neighbors.iter().filter_map(|(pos, cell)| matches!(cell, Cell::Unknown).then(|| *pos)) {
+                        if mines == flags {
+                            for p in neighbors.iter().filter_map(|(pos, cell)| {
+                                matches!(cell, Cell::Unknown).then(|| *pos)
+                            }) {
                                 self.uncover(p)?;
                                 next.push(p);
                             }
                             new_info = true;
-                        } else if unknowns + flags == bombs {
-                            for p in neighbors.iter().filter_map(|(pos, cell)| matches!(cell, Cell::Unknown).then(|| *pos)) {
+                        } else if unknowns + flags == mines {
+                            for p in neighbors.iter().filter_map(|(pos, cell)| {
+                                matches!(cell, Cell::Unknown).then(|| *pos)
+                            }) {
                                 self.plant_flag(p)?;
                             }
                             new_info = true;
                         } else {
                             next.push(pos);
                         }
-
                     }
                     Cell::Unknown => {
                         self.uncover(pos)?;
@@ -183,67 +194,83 @@ impl<'a> Solver<'a> {
                 }
             }
 
-
             if new_info {
                 continue;
             }
 
             // Simple algo didn't find new info, try heavier iterative algo now.
 
-            let flags: i32 = self.board.iter().filter(|cell| matches!(cell, Cell::Flag)).count().try_into().unwrap();
+            let flags: i32 = self
+                .board
+                .iter()
+                .filter(|cell| matches!(cell, Cell::Flag))
+                .count()
+                .try_into()
+                .unwrap();
 
             let mut unknowns = Vec::new();
             for col in 0..self.minefield.width {
                 for row in 0..self.minefield.height {
                     let pos = Pos(col, row);
-                    match self.get(pos) {
-                        Some(Cell::Unknown) => unknowns.push(pos),
-                        _ => (),
+                    if let Some(Cell::Unknown) = self.get(pos) {
+                        unknowns.push(pos)
                     }
                 }
             }
 
             // Already done
-            if unknowns.len() == 0 {
+            if unknowns.is_empty() {
                 break;
             }
 
             let remaining_mines = self.minefield.number_of_mines - flags;
             let naive_chance = remaining_mines as f32 / unknowns.len() as f32;
-            let mut probs: HashMap<Pos, f32> = unknowns.iter().copied().map(|pos| (pos, naive_chance)).collect();
+            let mut probs: HashMap<Pos, f32> = unknowns
+                .iter()
+                .copied()
+                .map(|pos| (pos, naive_chance))
+                .collect();
 
             for i in 0..100 {
-
                 let mut max_correction_diff = 0f32;
 
                 for pos in active.iter().copied() {
-                    let cell = self.get(pos).ok_or(anyhow!("Bad active cell location"))?;
+                    let cell = self
+                        .get(pos)
+                        .ok_or_else(|| anyhow!("Bad active cell location"))?;
 
-                    match cell {
-                        Cell::Number(bombs) => {
-                            let bombs: i32 = bombs.into();
-                            let neighbors = self.neighbors(pos);
-                            let flags: i32 = neighbors.iter().filter(|(_, cell)| matches!(cell, Cell::Flag)).count().try_into().unwrap();
-                            let unknowns: Vec<Pos> = neighbors.iter().filter_map(|(pos, cell)| matches!(cell, Cell::Unknown).then(|| (*pos))).collect();
+                    if let Cell::Number(mines) = cell {
+                        let mines: i32 = mines.into();
+                        let neighbors = self.neighbors(pos);
+                        let flags: i32 = neighbors
+                            .iter()
+                            .filter(|(_, cell)| matches!(cell, Cell::Flag))
+                            .count()
+                            .try_into()
+                            .unwrap();
+                        let unknowns: Vec<Pos> = neighbors
+                            .iter()
+                            .filter_map(|(pos, cell)| matches!(cell, Cell::Unknown).then(|| (*pos)))
+                            .collect();
 
-                            let expected = (bombs - flags) as f32;
-                            let sum: f32 = unknowns.iter().map(|pos| *probs.get(pos).unwrap()).sum();
+                        let expected = (mines - flags) as f32;
+                        let sum: f32 = unknowns.iter().map(|pos| *probs.get(pos).unwrap()).sum();
 
-                            let correction = expected / sum;
+                        let correction = expected / sum;
 
-                            max_correction_diff = f32::max(max_correction_diff, f32::abs(1f32 - correction));
+                        max_correction_diff =
+                            f32::max(max_correction_diff, f32::abs(1f32 - correction));
 
-                            for pos in unknowns {
-                                probs.get_mut(&pos).map(|p| *p *= correction);
+                        for pos in unknowns {
+                            if let Some(p) = probs.get_mut(&pos) {
+                                *p *= correction;
                             }
-
                         }
-                        _ => (),
                     }
                 }
 
                 // Normalize total prob
-                let sum: f32 = probs.iter().map(|(_,p)| *p).sum();
+                let sum: f32 = probs.iter().map(|(_, p)| *p).sum();
                 let correction = remaining_mines as f32 / sum;
                 for (_, p) in probs.iter_mut() {
                     *p *= correction;
@@ -258,10 +285,12 @@ impl<'a> Solver<'a> {
                     dbg!(i);
                     break;
                 }
-
             }
 
-            let best_guess = probs.iter().min_by(|(_,p1), (_, p2)| (*p1).partial_cmp(*p2).unwrap()).unwrap();
+            let best_guess = probs
+                .iter()
+                .min_by(|(_, p1), (_, p2)| (*p1).partial_cmp(*p2).unwrap())
+                .unwrap();
 
             println!("{:?} {}", best_guess, naive_chance);
 
@@ -273,15 +302,26 @@ impl<'a> Solver<'a> {
                 self.show();
             }
             poke?;
-
         }
 
         Ok(())
     }
 
     fn solved(&self) -> bool {
-        let flags: i32 = self.board.iter().filter(|cell| matches!(cell, Cell::Flag)).count().try_into().unwrap();
-        let unknowns: i32 = self.board.iter().filter(|cell| matches!(cell, Cell::Unknown)).count().try_into().unwrap();
+        let flags: i32 = self
+            .board
+            .iter()
+            .filter(|cell| matches!(cell, Cell::Flag))
+            .count()
+            .try_into()
+            .unwrap();
+        let unknowns: i32 = self
+            .board
+            .iter()
+            .filter(|cell| matches!(cell, Cell::Unknown))
+            .count()
+            .try_into()
+            .unwrap();
         unknowns == 0 && flags == self.minefield.number_of_mines
     }
 
@@ -296,11 +336,10 @@ impl<'a> Solver<'a> {
                     _ => (),
                 }
             }
-            println!("");
+            println!();
         }
     }
 }
-
 
 #[derive(Parser)]
 #[clap(about, long_about = None)]
@@ -310,7 +349,6 @@ struct Cli {
 }
 
 fn main() -> Result<()> {
-
     let cli = Cli::parse();
 
     Python::with_gil(|py| {
@@ -322,7 +360,7 @@ fn main() -> Result<()> {
 
         solver.show();
 
-        println!("");
+        println!();
         println!("Solved: {}", solver.solved());
 
         Ok(())
