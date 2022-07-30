@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use anyhow::{anyhow, Result};
 use pyo3::{prelude::*, types::PyDict};
 use owo_colors::OwoColorize;
@@ -56,6 +57,9 @@ impl<'a> Minefield<'a> {
     }
 }
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+struct Pos (i32, i32);
+
 #[derive(Clone, Copy)]
 enum Cell {
     Unknown,
@@ -77,7 +81,8 @@ impl<'a> Solver<'a> {
         })
     }
 
-    fn index(&self, col: i32, row: i32) -> Option<usize> {
+    fn index(&self, pos: Pos) -> Option<usize> {
+        let Pos(col, row) = pos;
         if col < 0 || col >= self.minefield.width || row < 0 || row >= self.minefield.height {
             return None;
         }
@@ -86,25 +91,27 @@ impl<'a> Solver<'a> {
         Some(index)
     }
 
-    fn get(&self, col: i32, row: i32) -> Option<Cell> {
-        self.index(col, row).map(|i| self.board[i])
+    fn get(&self, pos: Pos) -> Option<Cell> {
+        self.index(pos).map(|i| self.board[i])
     }
 
-    fn uncover(&mut self, col: i32, row: i32) -> Result<Cell> {
+    fn uncover(&mut self, pos: Pos) -> Result<Cell> {
+        let Pos(col, row) = pos;
         let n = self.minefield.sweep_cell(col, row)?;
         let cell = Cell::Number(n);
-        let i = self.index(col, row).ok_or(anyhow!("Bad index"))?;
+        let i = self.index(pos).ok_or(anyhow!("Bad index"))?;
         self.board[i] = cell;
         Ok(cell)
     }
 
-    fn plant_flag(&mut self, col: i32, row: i32) -> Result<()> {
-        let i = self.index(col, row).ok_or(anyhow!("Bad index"))?;
+    fn plant_flag(&mut self, pos: Pos) -> Result<()> {
+        let i = self.index(pos).ok_or(anyhow!("Bad index"))?;
         self.board[i] = Cell::Flag;
         Ok(())
     }
 
-    fn neighbors(&self, col: i32, row: i32) -> Vec<(i32, i32, Cell)> {
+    fn neighbors(&self, pos: Pos) -> Vec<(Pos, Cell)> {
+        let Pos(col, row) = pos;
         let list = [
             (1, 1),
             (1, 0),
@@ -115,11 +122,11 @@ impl<'a> Solver<'a> {
             (-1, 0),
             (-1, -1),
         ];
-        let r: Vec<(i32, i32, Cell)> = list
+        let r: Vec<(Pos, Cell)> = list
             .iter()
             .map(|(c, r)| {
-                self.get(col + c, row + r)
-                    .map(|cell| (col + c, row + r, cell))
+                self.get(Pos(col + c, row + r))
+                    .map(|cell| (Pos(col + c, row + r), cell))
             })
             .filter_map(|id| id)
             .collect();
@@ -128,57 +135,145 @@ impl<'a> Solver<'a> {
     }
 
     fn solve(&mut self) -> Result<()> {
-        let mut active: Vec<(i32, i32)> = Vec::new();
-        let mut new: Vec<(i32, i32)> = Vec::new();
-        let mut old: Vec<(i32, i32)> = Vec::new();
+        let mut active: Vec<Pos> = Vec::new();
+        let mut next: Vec<Pos> = Vec::new();
 
         // First guess
-        new.push((0, 0));
+        next.push(Pos(0, 0));
 
         loop {
 
             active.clear();
-            active.append(&mut new);
-            active.append(&mut old);
+            std::mem::swap(&mut active, &mut next);
+            let mut new_info = false;
 
 
-            for (col, row) in active.iter().copied() {
-                let mut cell = self.get(col, row).ok_or(anyhow!("Bad active cell location"))?;
-                if matches!(cell, Cell::Unknown) {
-                    cell = self.uncover(col, row)?;
-                }
+            for pos in active.iter().copied() {
+                let cell = self.get(pos).ok_or(anyhow!("Bad active cell location"))?;
 
                 match cell {
                     Cell::Number(bombs) => {
                         let bombs: i32 = bombs.into();
-                        let neighbors = self.neighbors(col, row);
-                        let flags: i32 = neighbors.iter().filter(|(_,_,cell)| matches!(cell, Cell::Flag)).count().try_into().unwrap();
-                        let unknowns: i32 = neighbors.iter().filter(|(_,_,cell)| matches!(cell, Cell::Unknown)).count().try_into().unwrap();
+                        let neighbors = self.neighbors(pos);
+                        let flags: i32 = neighbors.iter().filter(|(_, cell)| matches!(cell, Cell::Flag)).count().try_into().unwrap();
+                        let unknowns: i32 = neighbors.iter().filter(|(_, cell)| matches!(cell, Cell::Unknown)).count().try_into().unwrap();
 
                         if bombs == flags {
-                            let iter = neighbors.iter().filter_map(|(col, row, cell)| matches!(cell, Cell::Unknown).then(|| (*col, *row)));
-                            new.extend( iter );
-                        } else if unknowns + flags == bombs {
-
-                            let mark: Vec<(i32, i32)> = neighbors.iter().filter_map(|(col, row, cell)| matches!(cell, Cell::Unknown).then(|| (*col, *row))).collect();
-
-                            for (col, row) in mark.iter().copied() {
-                                self.plant_flag(col,row)?;
+                            for p in neighbors.iter().filter_map(|(pos, cell)| matches!(cell, Cell::Unknown).then(|| *pos)) {
+                                self.uncover(p)?;
+                                next.push(p);
                             }
-
-                            new.extend( mark );
+                            new_info = true;
+                        } else if unknowns + flags == bombs {
+                            for p in neighbors.iter().filter_map(|(pos, cell)| matches!(cell, Cell::Unknown).then(|| *pos)) {
+                                self.plant_flag(p)?;
+                            }
+                            new_info = true;
                         } else {
-                            old.push((col, row));
+                            next.push(pos);
                         }
 
+                    }
+                    Cell::Unknown => {
+                        self.uncover(pos)?;
+                        next.push(pos);
+                        new_info = true;
                     }
                     _ => (),
                 }
             }
 
-            if new.is_empty() {
+
+            if new_info {
+                continue;
+            }
+
+            // Simple algo didn't find new info, try heavier iterative algo now.
+
+            let flags: i32 = self.board.iter().filter(|cell| matches!(cell, Cell::Flag)).count().try_into().unwrap();
+
+            let mut unknowns = Vec::new();
+            for col in 0..self.minefield.width {
+                for row in 0..self.minefield.height {
+                    let pos = Pos(col, row);
+                    match self.get(pos) {
+                        Some(Cell::Unknown) => unknowns.push(pos),
+                        _ => (),
+                    }
+                }
+            }
+
+            // Already done
+            if unknowns.len() == 0 {
                 break;
             }
+
+            let remaining_mines = self.minefield.number_of_mines - flags;
+            let naive_chance = remaining_mines as f32 / unknowns.len() as f32;
+            let mut probs: HashMap<Pos, f32> = unknowns.iter().copied().map(|pos| (pos, naive_chance)).collect();
+
+            for i in 0..100 {
+
+                let mut max_correction_diff = 0f32;
+
+                for pos in active.iter().copied() {
+                    let cell = self.get(pos).ok_or(anyhow!("Bad active cell location"))?;
+
+                    match cell {
+                        Cell::Number(bombs) => {
+                            let bombs: i32 = bombs.into();
+                            let neighbors = self.neighbors(pos);
+                            let flags: i32 = neighbors.iter().filter(|(_, cell)| matches!(cell, Cell::Flag)).count().try_into().unwrap();
+                            let unknowns: Vec<Pos> = neighbors.iter().filter_map(|(pos, cell)| matches!(cell, Cell::Unknown).then(|| (*pos))).collect();
+
+                            let expected = (bombs - flags) as f32;
+                            let sum: f32 = unknowns.iter().map(|pos| *probs.get(pos).unwrap()).sum();
+
+                            let correction = expected / sum;
+
+                            max_correction_diff = f32::max(max_correction_diff, f32::abs(1f32 - correction));
+
+                            for pos in unknowns {
+                                probs.get_mut(&pos).map(|p| *p *= correction);
+                            }
+
+                        }
+                        _ => (),
+                    }
+                }
+
+                // Normalize total prob
+                let sum: f32 = probs.iter().map(|(_,p)| *p).sum();
+                let correction = remaining_mines as f32 / sum;
+                for (_, p) in probs.iter_mut() {
+                    *p *= correction;
+                }
+                //dbg!(correction);
+
+                max_correction_diff = f32::max(max_correction_diff, f32::abs(1f32 - correction));
+
+                //dbg!(max_correction_diff);
+
+                if max_correction_diff < 0.0001 {
+                    dbg!(i);
+                    break;
+                }
+
+            }
+
+            let best_guess = probs.iter().min_by(|(_,p1), (_, p2)| (*p1).partial_cmp(*p2).unwrap()).unwrap();
+
+            println!("{:?} {}", best_guess, naive_chance);
+
+            let pos = *best_guess.0;
+            let poke = self.uncover(pos);
+            next.push(pos);
+
+            if poke.is_err() {
+                self.show();
+            }
+            poke?;
+
         }
 
         Ok(())
@@ -193,7 +288,7 @@ impl<'a> Solver<'a> {
     fn show(&self) {
         for row in 0..self.minefield.height {
             for col in 0..self.minefield.width {
-                match self.get(col, row) {
+                match self.get(Pos(col, row)) {
                     Some(Cell::Flag) => print!("{} ", "F".bold().red()),
                     Some(Cell::Unknown) => print!(". "),
                     Some(Cell::Number(0)) => print!("  "),
