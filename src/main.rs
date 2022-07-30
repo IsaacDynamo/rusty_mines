@@ -6,7 +6,7 @@ use std::collections::HashMap;
 
 const SOURCE: &str = include_str!("../lib/decode_demcon3/mineField.py");
 
-#[derive(Subcommand)]
+#[derive(Subcommand, Copy, Clone, Debug)]
 enum Mode {
     Beginner,
     Intermediate,
@@ -51,9 +51,13 @@ impl<'a> Minefield<'a> {
         })
     }
 
-    fn sweep_cell(&self, column: i32, row: i32) -> Result<u8> {
-        let result = self.field.call_method("sweep_cell", (column, row), None)?;
-        Ok(result.extract()?)
+    fn sweep_cell(&self, column: i32, row: i32) -> Result<Cell> {
+        let result = self.field.call_method("sweep_cell", (column, row), None);
+        match result {
+            Ok(result) => Ok(Cell::Number(result.extract()?)),
+            Err(e) if format!("{}", e) == "ExplosionException: " => Ok(Cell::Mine),
+            Err(e) => Err(e.into()),
+        }
     }
 }
 
@@ -65,6 +69,7 @@ enum Cell {
     Unknown,
     Flag,
     Number(u8),
+    Mine,
 }
 
 struct Solver<'a> {
@@ -97,8 +102,7 @@ impl<'a> Solver<'a> {
 
     fn uncover(&mut self, pos: Pos) -> Result<Cell> {
         let Pos(col, row) = pos;
-        let n = self.minefield.sweep_cell(col, row)?;
-        let cell = Cell::Number(n);
+        let cell = self.minefield.sweep_cell(col, row)?;
         let i = self.index(pos).ok_or_else(|| anyhow!("Bad index"))?;
         self.board[i] = cell;
         Ok(cell)
@@ -133,10 +137,10 @@ impl<'a> Solver<'a> {
         r
     }
 
-    fn solve(&mut self) -> Result<()> {
+    fn solve(&mut self) -> Result<bool> {
         let mut active: Vec<Pos> = Vec::new();
 
-        // First guess
+        // First guess: 0,0 why not
         let mut next = vec![Pos(0, 0)];
 
         loop {
@@ -166,7 +170,9 @@ impl<'a> Solver<'a> {
                             .try_into()
                             .unwrap();
 
-                        if mines == flags {
+                        if unknowns == 0 {
+                            // Done
+                        } else if mines == flags {
                             for p in neighbors.iter().filter_map(|(pos, cell)| {
                                 matches!(cell, Cell::Unknown).then(|| *pos)
                             }) {
@@ -190,6 +196,7 @@ impl<'a> Solver<'a> {
                         next.push(pos);
                         new_info = true;
                     }
+                    Cell::Mine => return Ok(false),
                     _ => (),
                 }
             }
@@ -224,6 +231,15 @@ impl<'a> Solver<'a> {
             }
 
             let remaining_mines = self.minefield.number_of_mines - flags;
+
+            // Uncover remaining cells when all mines are flagged, then we are done
+            if remaining_mines == 0 {
+                for pos in unknowns {
+                    self.uncover(pos)?;
+                }
+                break;
+            }
+
             let naive_chance = remaining_mines as f32 / unknowns.len() as f32;
             let mut probs: HashMap<Pos, f32> = unknowns
                 .iter()
@@ -231,7 +247,7 @@ impl<'a> Solver<'a> {
                 .map(|pos| (pos, naive_chance))
                 .collect();
 
-            for i in 0..100 {
+            for _ in 0..100 {
                 let mut max_correction_diff = 0f32;
 
                 for pos in active.iter().copied() {
@@ -255,7 +271,6 @@ impl<'a> Solver<'a> {
 
                         let expected = (mines - flags) as f32;
                         let sum: f32 = unknowns.iter().map(|pos| *probs.get(pos).unwrap()).sum();
-
                         let correction = expected / sum;
 
                         max_correction_diff =
@@ -270,19 +285,16 @@ impl<'a> Solver<'a> {
                 }
 
                 // Normalize total prob
-                let sum: f32 = probs.iter().map(|(_, p)| *p).sum();
+                let sum: f32 = probs.iter().map(|(_, p)| p).copied().sum();
                 let correction = remaining_mines as f32 / sum;
                 for (_, p) in probs.iter_mut() {
                     *p *= correction;
                 }
-                //dbg!(correction);
 
                 max_correction_diff = f32::max(max_correction_diff, f32::abs(1f32 - correction));
 
-                //dbg!(max_correction_diff);
-
+                // Enough conversion, done iterating
                 if max_correction_diff < 0.0001 {
-                    dbg!(i);
                     break;
                 }
             }
@@ -292,19 +304,17 @@ impl<'a> Solver<'a> {
                 .min_by(|(_, p1), (_, p2)| (*p1).partial_cmp(*p2).unwrap())
                 .unwrap();
 
-            println!("{:?} {}", best_guess, naive_chance);
+            //println!("{:?} {}", best_guess, naive_chance);
 
             let pos = *best_guess.0;
-            let poke = self.uncover(pos);
-            next.push(pos);
-
-            if poke.is_err() {
-                self.show();
+            let cell = self.uncover(pos)?;
+            if let Cell::Mine = cell {
+                return Ok(false);
             }
-            poke?;
+            next.push(pos);
         }
 
-        Ok(())
+        Ok(self.solved())
     }
 
     fn solved(&self) -> bool {
@@ -322,18 +332,25 @@ impl<'a> Solver<'a> {
             .count()
             .try_into()
             .unwrap();
-        unknowns == 0 && flags == self.minefield.number_of_mines
+        let mines: i32 = self
+            .board
+            .iter()
+            .filter(|cell| matches!(cell, Cell::Mine))
+            .count()
+            .try_into()
+            .unwrap();
+        unknowns == 0 && mines == 0 && flags == self.minefield.number_of_mines
     }
 
     fn show(&self) {
         for row in 0..self.minefield.height {
             for col in 0..self.minefield.width {
-                match self.get(Pos(col, row)) {
-                    Some(Cell::Flag) => print!("{} ", "F".bold().red()),
-                    Some(Cell::Unknown) => print!(". "),
-                    Some(Cell::Number(0)) => print!("  "),
-                    Some(Cell::Number(x)) => print!("{} ", x),
-                    _ => (),
+                match self.get(Pos(col, row)).unwrap() {
+                    Cell::Flag => print!("{} ", "F".bold().cyan()),
+                    Cell::Unknown => print!(". "),
+                    Cell::Number(0) => print!("  "),
+                    Cell::Number(x) => print!("{} ", x),
+                    Cell::Mine => print!("{} ", "X".bold().red()),
                 }
             }
             println!();
@@ -346,22 +363,39 @@ impl<'a> Solver<'a> {
 struct Cli {
     #[clap(subcommand)]
     mode: Mode,
+
+    #[clap(short, long, value_parser)]
+    iterations: Option<usize>,
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
     Python::with_gil(|py| {
-        let minefield = Minefield::new(py, cli.mode)?;
+        if let Some(iterations) = cli.iterations {
+            let mut success = 0;
+            for _ in 0..iterations {
+                let minefield = Minefield::new(py, cli.mode)?;
+                let mut solver = Solver::new(&minefield)?;
+                if solver.solve()? {
+                    success += 1;
+                }
+            }
 
-        let mut solver = Solver::new(&minefield)?;
+            println!(
+                "Solved {}/{} successful, {:?}",
+                success, iterations, cli.mode
+            );
+        } else {
+            let minefield = Minefield::new(py, cli.mode)?;
+            let mut solver = Solver::new(&minefield)?;
 
-        solver.solve()?;
+            let solved = solver.solve()?;
+            solver.show();
 
-        solver.show();
-
-        println!();
-        println!("Solved: {}", solver.solved());
+            println!();
+            println!("Solved: {}", solved);
+        }
 
         Ok(())
     })
