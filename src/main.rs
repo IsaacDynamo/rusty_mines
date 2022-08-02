@@ -168,8 +168,9 @@ impl<'a> Solver<'a> {
         r
     }
 
-    fn solve(&mut self) -> Result<bool> {
+    fn solve(&mut self) -> Result<(bool, f32)> {
         let mut active: Vec<Pos> = Vec::new();
+        let mut luck = 1f32;
 
         // First guess: 0,0 why not
         let mut next = vec![Pos(0, 0)];
@@ -227,7 +228,7 @@ impl<'a> Solver<'a> {
                         next.push(pos);
                         new_info = true;
                     }
-                    Cell::Mine => return Ok(false),
+                    Cell::Mine => return Ok((false, luck)),
                     _ => (),
                 }
             }
@@ -329,15 +330,17 @@ impl<'a> Solver<'a> {
 
             //println!("{:?} {}", best_guess, naive_chance);
 
+            luck *= 1f32 - best_guess.1;
+
             let pos = *best_guess.0;
             let cell = self.uncover(pos)?;
             if let Cell::Mine = cell {
-                return Ok(false);
+                return Ok((false, luck));
             }
             next.push(pos);
         }
 
-        Ok(self.solved())
+        Ok((self.solved(), luck))
     }
 
     fn solved(&self) -> bool {
@@ -399,27 +402,32 @@ fn main() -> Result<()> {
 
         if let Some(iterations) = cli.iterations {
             let mut success = 0;
+            let mut luck_sum = 0f32;
             for _ in 0..iterations {
                 let minefield = builder.build(cli.mode)?;
                 let mut solver = Solver::new(&minefield)?;
-                if solver.solve()? {
+                if let (true, luck) = solver.solve()? {
                     success += 1;
+                    luck_sum += luck;
                 }
             }
 
             println!(
-                "Solved {}/{} successful, {:?}",
-                success, iterations, cli.mode
+                "Solved {}/{} successful, {:?}, avg luck {}",
+                success,
+                iterations,
+                cli.mode,
+                luck_sum / success as f32
             );
         } else {
             let minefield = builder.build(cli.mode)?;
             let mut solver = Solver::new(&minefield)?;
 
-            let solved = solver.solve()?;
+            let (solved, luck) = solver.solve()?;
             solver.show();
 
             println!();
-            println!("Solved: {}", solved);
+            println!("Solved: {}, luck: {}", solved, luck);
         }
 
         Ok(())
