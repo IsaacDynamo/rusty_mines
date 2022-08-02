@@ -6,11 +6,62 @@ use std::collections::HashMap;
 
 const SOURCE: &str = include_str!("../lib/decode_demcon3/mineField.py");
 
-#[derive(Subcommand, Copy, Clone, Debug)]
+#[derive(Subcommand, Copy, Clone, Debug, PartialEq, Eq, Hash)]
 enum Mode {
     Beginner,
     Intermediate,
     Expert,
+}
+
+struct MinefieldBuilder<'a> {
+    class: &'a PyAny,
+    presets: HashMap<Mode, (i32, i32, i32, &'a PyDict)>,
+}
+
+impl<'a> MinefieldBuilder<'a> {
+    fn new(py: Python<'a>) -> Result<Self> {
+        let module = PyModule::from_code(py, SOURCE, "mineField", "mineField")?;
+        let class = module.getattr("MineField")?;
+
+        let list = [
+            (Mode::Beginner, "BEGINNER_FIELD"),
+            (Mode::Intermediate, "INTERMEDIATE_FIELD"),
+            (Mode::Expert, "EXPERT_FIELD"),
+        ];
+
+        let presets = list
+            .iter()
+            .map(|(mode, name)| {
+                let kwargs = module
+                    .getattr(name)?
+                    .downcast::<PyDict>()
+                    .map_err(|e| anyhow!("{}", e))?;
+
+                let width: i32 = PyAny::get_item(kwargs, "width")?.extract()?;
+                let height: i32 = PyAny::get_item(kwargs, "height")?.extract()?;
+                let number_of_mines: i32 = PyAny::get_item(kwargs, "number_of_mines")?.extract()?;
+
+                Ok((*mode, (width, height, number_of_mines, kwargs)))
+            })
+            .collect::<Result<HashMap<Mode, (i32, i32, i32, &PyDict)>>>()?;
+
+        Ok(Self { class, presets })
+    }
+
+    fn build(&self, mode: Mode) -> Result<Minefield<'a>> {
+        let args = self
+            .presets
+            .get(&mode)
+            .ok_or_else(|| anyhow!("Mode not found"))?;
+        let field = self.class.call((), Some(args.3))?;
+
+        Ok(Minefield {
+            field,
+            width: args.0,
+            height: args.1,
+            number_of_mines: args.2,
+        })
+    }
 }
 
 #[derive(Debug)]
@@ -22,35 +73,6 @@ struct Minefield<'a> {
 }
 
 impl<'a> Minefield<'a> {
-    fn new(py: Python<'a>, mode: Mode) -> Result<Self> {
-        let module = PyModule::from_code(py, SOURCE, "mineField", "mineField")?;
-        let minefield = module.getattr("MineField")?;
-
-        let preset = match mode {
-            Mode::Beginner => "BEGINNER_FIELD",
-            Mode::Intermediate => "INTERMEDIATE_FIELD",
-            Mode::Expert => "EXPERT_FIELD",
-        };
-
-        let kwargs = module
-            .getattr(preset)?
-            .downcast::<PyDict>()
-            .map_err(|e| anyhow!("{}", e))?;
-
-        let width: i32 = PyAny::get_item(kwargs, "width")?.extract()?;
-        let height: i32 = PyAny::get_item(kwargs, "height")?.extract()?;
-        let number_of_mines: i32 = PyAny::get_item(kwargs, "number_of_mines")?.extract()?;
-
-        let field = minefield.call((), Some(kwargs))?;
-
-        Ok(Self {
-            field,
-            width,
-            height,
-            number_of_mines,
-        })
-    }
-
     fn sweep_cell(&self, column: i32, row: i32) -> Result<Cell> {
         let result = self.field.call_method("sweep_cell", (column, row), None);
         match result {
@@ -64,7 +86,7 @@ impl<'a> Minefield<'a> {
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 struct Pos(i32, i32);
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum Cell {
     Unknown,
     Flag,
@@ -75,6 +97,8 @@ enum Cell {
 struct Solver<'a> {
     minefield: &'a Minefield<'a>,
     board: Vec<Cell>,
+    flags: i32,
+    unknowns: i32,
 }
 
 impl<'a> Solver<'a> {
@@ -83,6 +107,8 @@ impl<'a> Solver<'a> {
         Ok(Self {
             minefield,
             board: vec![Cell::Unknown; size],
+            flags: 0,
+            unknowns: size.try_into().unwrap(),
         })
     }
 
@@ -104,13 +130,18 @@ impl<'a> Solver<'a> {
         let Pos(col, row) = pos;
         let cell = self.minefield.sweep_cell(col, row)?;
         let i = self.index(pos).ok_or_else(|| anyhow!("Bad index"))?;
+        assert!(self.board[i] == Cell::Unknown);
         self.board[i] = cell;
+        self.unknowns -= 1;
         Ok(cell)
     }
 
     fn plant_flag(&mut self, pos: Pos) -> Result<()> {
         let i = self.index(pos).ok_or_else(|| anyhow!("Bad index"))?;
+        assert!(self.board[i] == Cell::Unknown);
         self.board[i] = Cell::Flag;
+        self.flags += 1;
+        self.unknowns -= 1;
         Ok(())
     }
 
@@ -201,19 +232,16 @@ impl<'a> Solver<'a> {
                 }
             }
 
+            // Already done
+            if self.unknowns == 0 {
+                break;
+            }
+
             if new_info {
                 continue;
             }
 
             // Simple algo didn't find new info, try heavier iterative algo now.
-
-            let flags: i32 = self
-                .board
-                .iter()
-                .filter(|cell| matches!(cell, Cell::Flag))
-                .count()
-                .try_into()
-                .unwrap();
 
             let mut unknowns = Vec::new();
             for col in 0..self.minefield.width {
@@ -225,12 +253,7 @@ impl<'a> Solver<'a> {
                 }
             }
 
-            // Already done
-            if unknowns.is_empty() {
-                break;
-            }
-
-            let remaining_mines = self.minefield.number_of_mines - flags;
+            let remaining_mines = self.minefield.number_of_mines - self.flags;
 
             // Uncover remaining cells when all mines are flagged, then we are done
             if remaining_mines == 0 {
@@ -240,7 +263,7 @@ impl<'a> Solver<'a> {
                 break;
             }
 
-            let naive_chance = remaining_mines as f32 / unknowns.len() as f32;
+            let naive_chance = remaining_mines as f32 / self.unknowns as f32;
             let mut probs: HashMap<Pos, f32> = unknowns
                 .iter()
                 .copied()
@@ -372,10 +395,12 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     Python::with_gil(|py| {
+        let builder = MinefieldBuilder::new(py)?;
+
         if let Some(iterations) = cli.iterations {
             let mut success = 0;
             for _ in 0..iterations {
-                let minefield = Minefield::new(py, cli.mode)?;
+                let minefield = builder.build(cli.mode)?;
                 let mut solver = Solver::new(&minefield)?;
                 if solver.solve()? {
                     success += 1;
@@ -387,7 +412,7 @@ fn main() -> Result<()> {
                 success, iterations, cli.mode
             );
         } else {
-            let minefield = Minefield::new(py, cli.mode)?;
+            let minefield = builder.build(cli.mode)?;
             let mut solver = Solver::new(&minefield)?;
 
             let solved = solver.solve()?;
