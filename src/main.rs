@@ -3,6 +3,7 @@ use clap::{Parser, Subcommand};
 use owo_colors::OwoColorize;
 use pyo3::{prelude::*, types::PyDict};
 use std::collections::HashMap;
+use rand::{thread_rng, Rng};
 
 const SOURCE: &str = include_str!("../lib/decode_demcon3/mineField.py");
 
@@ -76,7 +77,7 @@ impl<'a> MinefieldBuilder<'a> {
 }
 
 trait Minefield {
-    fn sweep_cell(&self, column: i32, row: i32) -> Result<Cell>;
+    fn sweep_cell(&mut self, column: i32, row: i32) -> Result<Cell>;
     fn width(&self) -> i32;
     fn height(&self) -> i32;
     fn number_of_mines(&self) -> i32;
@@ -91,7 +92,7 @@ struct PythonMinefield<'a> {
 }
 
 impl<'a> Minefield for PythonMinefield<'a> {
-    fn sweep_cell(&self, column: i32, row: i32) -> Result<Cell> {
+    fn sweep_cell(&mut self, column: i32, row: i32) -> Result<Cell> {
         let result = self.field.call_method("sweep_cell", (column, row), None);
         match result {
             Ok(result) => Ok(Cell::Number(result.extract()?)),
@@ -121,16 +122,45 @@ struct RustMinefield {
 }
 
 impl RustMinefield {
-    fn get(&self, col: i32, row: i32) -> Option<bool> {
+
+    fn new(mode: Mode) -> Self {
+        let (width, height, number_of_mines) = match mode {
+            Mode::Beginner => (10, 10, 10),
+            Mode::Intermediate => (16, 16, 40),
+            Mode::Expert => (30, 16, 99),
+        };
+
+        Self { field: Vec::new(), width, height, number_of_mines }
+    }
+
+    fn get(&mut self, col: i32, row: i32) -> Option<bool> {
         if col < 0 || col >= self.width || row < 0 || row >= self.height {
             return None;
         }
 
         let index: usize = (col + row * self.width).try_into().unwrap();
+
+        if self.field.is_empty() {
+            let size: usize = (self.width * self.height).try_into().unwrap();
+            self.field = vec![false; size];
+
+            let mut rng = thread_rng();
+
+            let mut mines_left = self.number_of_mines;
+            while mines_left != 0 {
+
+                let random_index = rng.gen_range(0..size);
+                if random_index != index && self.field[random_index] == false {
+                    self.field[random_index] = true;
+                    mines_left -= 1;
+                }
+            }
+        }
+
         Some(self.field[index])
     }
 
-    fn neighbors(&self, col: i32, row: i32) -> u8 {
+    fn neighbors(&mut self, col: i32, row: i32) -> u8 {
         NEIGHBORS
             .iter()
             .map(|(c, r)| -> u8 { self.get(col + c, row + r).unwrap_or(false).into() })
@@ -139,7 +169,7 @@ impl RustMinefield {
 }
 
 impl Minefield for RustMinefield {
-    fn sweep_cell(&self, column: i32, row: i32) -> Result<Cell> {
+    fn sweep_cell(&mut self, column: i32, row: i32) -> Result<Cell> {
         match self.get(column, row).unwrap() {
             true => Ok(Cell::Mine),
             false => Ok(Cell::Number(self.neighbors(column, row))),
@@ -171,14 +201,14 @@ enum Cell {
 }
 
 struct Solver<'a, T: Minefield> {
-    minefield: &'a T,
+    minefield: &'a mut T,
     board: Vec<Cell>,
     flags: i32,
     unknowns: i32,
 }
 
 impl<'a, T: Minefield> Solver<'a, T> {
-    fn new(minefield: &'a T) -> Result<Self> {
+    fn new(minefield: &'a mut T) -> Result<Self> {
         let size: usize = (minefield.width() * minefield.height()).try_into()?;
         Ok(Self {
             minefield,
@@ -494,51 +524,65 @@ struct Cli {
 
     #[clap(short, long, value_parser)]
     iterations: Option<usize>,
+
+    #[clap(short, long, value_parser)]
+    native: bool
+}
+
+fn body<T, M>(cli: Cli, new: T) -> Result<()>
+    where
+        T: Fn(Mode) -> Result<M>,
+        M: Minefield
+{
+    if let Some(iterations) = cli.iterations {
+        let mut success = 0;
+        let mut luck_sum = 0f32;
+        for _ in 0..iterations {
+            let mut minefield = new(cli.mode)?;
+            let mut solver = Solver::new(&mut minefield)?;
+            if let (true, luck) = solver.solve()? {
+                success += 1;
+                luck_sum += luck;
+            }
+        }
+
+        println!(
+            "Solved {}/{} successful, {:?}, avg luck {}",
+            success,
+            iterations,
+            cli.mode,
+            luck_sum / success as f32
+        );
+    } else {
+        let mut minefield = new(cli.mode)?;
+        let mut solver = Solver::new(&mut minefield)?;
+
+        let (solved, luck) = solver.solve()?;
+        solver.show();
+
+        println!();
+        println!("Solved: {}, luck: {}", solved, luck);
+    }
+
+    Ok(())
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    Python::with_gil(|py| {
-        let builder = MinefieldBuilder::new(py)?;
-
-        if let Some(iterations) = cli.iterations {
-            let mut success = 0;
-            let mut luck_sum = 0f32;
-            for _ in 0..iterations {
-                let minefield = builder.build(cli.mode)?;
-                let mut solver = Solver::new(&minefield)?;
-                if let (true, luck) = solver.solve()? {
-                    success += 1;
-                    luck_sum += luck;
-                }
-            }
-
-            println!(
-                "Solved {}/{} successful, {:?}, avg luck {}",
-                success,
-                iterations,
-                cli.mode,
-                luck_sum / success as f32
-            );
-        } else {
-            let minefield = builder.build(cli.mode)?;
-            let mut solver = Solver::new(&minefield)?;
-
-            let (solved, luck) = solver.solve()?;
-            solver.show();
-
-            println!();
-            println!("Solved: {}, luck: {}", solved, luck);
-        }
-
-        Ok(())
-    })
+    if cli.native {
+        body(cli, |mode: Mode| -> Result<_> { Ok(RustMinefield::new(mode))})
+    } else {
+        Python::with_gil(|py| {
+            let builder = MinefieldBuilder::new(py)?;
+            body(cli, |mode: Mode| builder.build(mode))
+        })
+    }
 }
 
 #[test]
 fn bla() -> Result<()> {
-    let minefield = RustMinefield {
+    let mut minefield = RustMinefield {
         field: vec![
             false, false, false, false, false, false, true, false, false, false, false, false,
             true, false, false, true,
@@ -548,7 +592,7 @@ fn bla() -> Result<()> {
         number_of_mines: 4,
     };
 
-    let mut solver = Solver::new(&minefield)?;
+    let mut solver = Solver::new(&mut minefield)?;
 
     solver.solve()?;
     assert!(solver.solved());

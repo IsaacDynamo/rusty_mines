@@ -8,6 +8,7 @@ edition = "2021"
 [dependencies]
 anyhow = "1.0.58"
 owo-colors = "3.4.0"
+rand = "0.8.5"
 
 [dependencies.pyo3]
 version = "0.16.5"
