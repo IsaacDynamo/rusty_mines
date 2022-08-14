@@ -2,8 +2,8 @@ use anyhow::{anyhow, Result};
 use clap::{Parser, Subcommand};
 use owo_colors::OwoColorize;
 use pyo3::{prelude::*, types::PyDict};
-use std::collections::HashMap;
 use rand::{thread_rng, Rng};
+use std::collections::HashMap;
 
 const SOURCE: &str = include_str!("../lib/decode_demcon3/mineField.py");
 
@@ -122,7 +122,6 @@ struct RustMinefield {
 }
 
 impl RustMinefield {
-
     fn new(mode: Mode) -> Self {
         let (width, height, number_of_mines) = match mode {
             Mode::Beginner => (10, 10, 10),
@@ -130,7 +129,12 @@ impl RustMinefield {
             Mode::Expert => (30, 16, 99),
         };
 
-        Self { field: Vec::new(), width, height, number_of_mines }
+        Self {
+            field: Vec::new(),
+            width,
+            height,
+            number_of_mines,
+        }
     }
 
     fn get(&mut self, col: i32, row: i32) -> Option<bool> {
@@ -148,9 +152,8 @@ impl RustMinefield {
 
             let mut mines_left = self.number_of_mines;
             while mines_left != 0 {
-
                 let random_index = rng.gen_range(0..size);
-                if random_index != index && self.field[random_index] == false {
+                if random_index != index && !self.field[random_index] {
                     self.field[random_index] = true;
                     mines_left -= 1;
                 }
@@ -365,7 +368,7 @@ impl<'a, T: Minefield> Solver<'a, T> {
                 }));
             }
 
-            for i in 0..100 {
+            for _ in 0..100 {
                 let mut max_correction_diff = 0f32;
 
                 for pos in active.iter().copied() {
@@ -389,20 +392,13 @@ impl<'a, T: Minefield> Solver<'a, T> {
 
                         let expected = (mines - flags) as f32;
                         let sum: f32 = unknowns.iter().map(|pos| *probs.get(pos).unwrap()).sum();
-                        let correction = expected / sum;
+                        let correction = (expected - sum) / unknowns.len() as f32;
 
-                        max_correction_diff =
-                            f32::max(max_correction_diff, f32::abs(1f32 - correction));
-
-                        if i == 99 && f32::abs(1f32 - correction) > 0.02 {
-                            //dbg!(correction, neighbors);
-                        }
+                        max_correction_diff = f32::max(max_correction_diff, f32::abs(correction));
 
                         for pos in unknowns {
                             if let Some(p) = probs.get_mut(&pos) {
-                                *p *= correction;
-                                *p = f32::min(*p, 1f32);
-                                assert!(*p <= 1f32, "{}", *p);
+                                *p = f32::clamp(*p + correction, 0f32, 1f32);
                             }
                         }
                     }
@@ -411,24 +407,16 @@ impl<'a, T: Minefield> Solver<'a, T> {
                 // Reduce total probability if it is more then the remaining mines
                 let sum: f32 = probs.iter().map(|(_, p)| p).copied().sum();
                 if sum > remaining_mines as f32 {
-                    let correction = remaining_mines as f32 / sum;
+                    let correction = (remaining_mines as f32 - sum) / probs.len() as f32;
                     for (_, p) in probs.iter_mut() {
-                        *p *= correction;
+                        *p = f32::clamp(*p + correction, 0f32, 1f32);
                     }
-                    max_correction_diff =
-                        f32::max(max_correction_diff, f32::abs(1f32 - correction));
+                    max_correction_diff = f32::max(max_correction_diff, f32::abs(correction));
                 }
 
                 // Enough conversion, done iterating
                 if max_correction_diff < 0.0001 {
-                    //dbg!(i, max_correction_diff);
                     break;
-                }
-
-                if i == 99 {
-                    //dbg!(max_correction_diff, &probs);
-                    //dbg!(max_correction_diff);
-                    //self.show();
                 }
             }
 
@@ -526,13 +514,13 @@ struct Cli {
     iterations: Option<usize>,
 
     #[clap(short, long, value_parser)]
-    native: bool
+    native: bool,
 }
 
 fn body<T, M>(cli: Cli, new: T) -> Result<()>
-    where
-        T: Fn(Mode) -> Result<M>,
-        M: Minefield
+where
+    T: Fn(Mode) -> Result<M>,
+    M: Minefield,
 {
     if let Some(iterations) = cli.iterations {
         let mut success = 0;
@@ -547,9 +535,10 @@ fn body<T, M>(cli: Cli, new: T) -> Result<()>
         }
 
         println!(
-            "Solved {}/{} successful, {:?}, avg luck {}",
+            "Solved {}/{} successful ({}), {:?}, avg luck {}",
             success,
             iterations,
+            success as f32 / iterations as f32,
             cli.mode,
             luck_sum / success as f32
         );
@@ -571,7 +560,9 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     if cli.native {
-        body(cli, |mode: Mode| -> Result<_> { Ok(RustMinefield::new(mode))})
+        body(cli, |mode: Mode| -> Result<_> {
+            Ok(RustMinefield::new(mode))
+        })
     } else {
         Python::with_gil(|py| {
             let builder = MinefieldBuilder::new(py)?;
@@ -589,7 +580,7 @@ fn bla() -> Result<()> {
         ],
         width: 4,
         height: 4,
-        number_of_mines: 4,
+        number_of_mines: 3,
     };
 
     let mut solver = Solver::new(&mut minefield)?;
